@@ -1,109 +1,155 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: >
-  sam-app
+Description: Build Lambda with EFS!
 
-  Sample SAM Template for sam-app
+Parameters:
+  VpcId:
+    Type: String
+    Default: your-vpc-id
 
-Globals:
-  Function:
-    Timeout: 3
+  VpcCidr:
+    Type: String
+    Default: 12.1.0.0/16
+
+  PublicSubnetId:
+    Type: String
+    Default: your-vpc-id's public subnet
+
+  PrivateSubnetId:
+    Type: String
+    Default: your-vpc-id's private subnet
 
 Resources:
-  EfsLambdaVpc:
-    Type: AWS::EC2::VPC
+  #
+  # EFS
+  #
+  EFSAccessSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
     Properties:
-      CidrBlock: "10.0.0.0/16"
-  EfsLambdaSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: "EFS + Lambda on SAM Security Group"
-      VpcId: !Ref EfsLambdaVpc
-      SecurityGroupEgress:
-        - CidrIp: "0.0.0.0/0"
-          FromPort: 0
-          ToPort: 65535
-          IpProtocol: tcp
+      GroupDescription: Security Group for Lambda and EFS communication
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
-        - CidrIp: "0.0.0.0/0"
-          FromPort: 0
-          ToPort: 65535
-          IpProtocol: tcp
-  EfsLambdaSubnetA:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref EfsLambdaVpc
-      AvailabilityZone: !Select [ 0, !GetAZs '' ]
-      MapPublicIpOnLaunch: false
-      CidrBlock: "10.0.0.0/24"
-  EfsLambdaSubnetB:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref EfsLambdaVpc
-      AvailabilityZone: !Select [ 1, !GetAZs '' ]
-      MapPublicIpOnLaunch: false
-      CidrBlock: "10.0.1.0/24"
-  EfsFileSystem:
+        - IpProtocol: tcp
+          FromPort: 2049  # NFS port used by EFS
+          ToPort: 2049
+          CidrIp: !Ref VpcCidr
+
+  EFSFileSystem:
     Type: AWS::EFS::FileSystem
-  MountTargetA:
+    Properties:
+      Encrypted: false
+
+  EFSMountTarget:
     Type: AWS::EFS::MountTarget
     Properties:
-      FileSystemId: !Ref EfsFileSystem
-      SubnetId: !Ref EfsLambdaSubnetA
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnetId
       SecurityGroups:
-        - !Ref EfsLambdaSecurityGroup
-  MountTargetB:
-    Type: AWS::EFS::MountTarget
-    Properties:
-      FileSystemId: !Ref EfsFileSystem
-      SubnetId: !Ref EfsLambdaSubnetB
-      SecurityGroups:
-        - !Ref EfsLambdaSecurityGroup
-  AccessPoint:
+        - !Ref EFSAccessSecurityGroup
+
+  EFSAccessPoint:
     Type: AWS::EFS::AccessPoint
     Properties:
-      FileSystemId: !Ref EfsFileSystem
+      FileSystemId: !Ref EFSFileSystem
       PosixUser:
-        Gid: "1000"
         Uid: "1000"
+        Gid: "1000"
       RootDirectory:
-        Path: "/lambda"
         CreationInfo:
           OwnerGid: "1000"
           OwnerUid: "1000"
-          Permissions: "755"
-  HelloEfsFunction:
-    Type: AWS::Serverless::Function
-    DependsOn:
-      - MountTargetA
-      - MountTargetB
+          Permissions: "0777"
+
+  #
+  # Lambda
+  #
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
     Properties:
-      CodeUri: hello_efs/
-      Handler: app.lambda_handler
-      Runtime: python3.11
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: '*'
+
+  LambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      FunctionName: my-function-name
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      # Compute
+      Timeout: 600
+      MemorySize: 4096
       Architectures:
         - x86_64
-      Policies:
-        - EFSWriteAccessPolicy:
-            FileSystem: !Ref EfsFileSystem
-            AccessPoint: !Ref AccessPoint
+
+      # Network
+      FileSystemConfigs:
+        - Arn: !GetAtt EFSAccessPoint.Arn
       VpcConfig:
         SecurityGroupIds:
-          - !Ref EfsLambdaSecurityGroup
+          - !Ref EFSAccessSecurityGroup
         SubnetIds:
-          - !Ref EfsLambdaSubnetA
-          - !Ref EfsLambdaSubnetB
-      FileSystemConfigs:
-        - Arn: !GetAtt AccessPoint.Arn
-          LocalMountPath: /mnt/lambda
-      Events:
-        HelloWorld:
-          Type: Api
-          Properties:
-            Path: /hello
-            Method: get
+          - !Ref PrivateSubnetId
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./src
+      DockerTag: test
 
-Outputs:
-  HelloEfsApi:
-    Description: "API Gateway endpoint URL for Prod stage for Hello EFS function"
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/hello/"
+  #
+  # EC2 Instance
+  #
+  EC2InstanceIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceIAMRole
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-07c589821f2b353aa # ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-20231207
+      InstanceType: t2.micro
+      SubnetId: !Ref PublicSubnetId
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
